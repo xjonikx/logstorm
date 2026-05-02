@@ -1,125 +1,28 @@
-Ниже — **технический отчёт** по фактам из репозитория и логов, без правок кода (код начнём после вашего утверждения плана).
+Here is what was completed in this pass:
 
----
+s_device / matrices
+mViewPresent / mWorldPresent — reproduce legacy GetTransform behaviour (relation offsets applied) for GetView / GetWorld, which now return these.
+RefreshMatrixPresents() — called at the end of ApplySceneMatrix, including the early return path after MulToInvNorm so matrices never desync.
+Declared ApplySceneMatrix in s_device.h (it was only defined in the .cpp before).
+FindPlanes — uses mProjection and mViewPresent (removed the leftover GetTransform).
+DrawRects — uses GetView / GetWorld, CMatrix identity instead of the broken IMatrix name.
+DrawVector / DrawEllipsoid — GetWorld() / SetWorld(...) instead of GetTransform / SetTransform.
+SetCurrentMatrix — SetWorld(CMatrix::FromFloat4x4(mtx)).
+Constructor — removed references to deleted m_cbPerFrame, m_cbLights, m_cbVSConstants, etc.; identity matrices + RefreshMatrixPresents() after relation vectors.
+ReleaseDevice — m_cbGpuPerFrame / m_cbGpuPerObject / m_cbGpuMaterial .Reset() instead of legacy S_RELEASE.
+SetMaterial — fills storm::gpu::CBMaterial and maps m_cbGpuMaterial (no raw RS_MATERIAL memcpy).
+BindSceneLight / SetSceneLightActive — pack all lights into m_cpuPerFrame, maintain LightMask, upload m_cbGpuPerFrame (removed m_cbLights path).
+GpuWriteUserVec4 — null check uses m_cbGpuMaterial.Get().
+SetTextureStageMatrix — updates TexMtx and maps m_cbGpuPerObject (no extra SetConstantBuffers so we don’t fight DX11ShaderManager).
+Call sites (no renderer GetTransform / SetTransform left)
+All usages listed in the handoff were switched to GetView / GetProjection / SetView / SetWorld (or memcpy into Matrix where the particle code still uses math3d::Matrix). bb_processor.cpp saves/restores view with CMatrix::FromFloat4x4.
 
-## 1. Диагностика по логам (`логи/`)
+PBR helper
+pbr_cgm_helper.cpp — memcpy from CMatrix into XMFLOAT4X4 (cannot assign XMFLOAT4X4 = GetView()).
+Build
+CMake failed here (cache path from another drive + no Visual Studio in the environment), so this wasn’t fully compiled on this machine.
 
-### `rendererlib.log`
-
-- Устройство DX11 создаётся с **feature level `0xB100`** (Direct3D 11.1).
-- Последовательность инициализации завершена успешно: **DX11ShaderManager** → **187 techniques** → **DX11Shader3D** → `InitDevice complete`.
-- В рантайме фиксируется **legacy-API освещения**: `SetLight[0]` с типом и вектором направления — то есть логика «как в DX9» по-прежнему вызывается с C++ стороны.
-
-**Критических HRESULT / падений / явных утечек в этих двух файлах не видно** (короткий `rendererlib.log` — чистая успешная сессия).
-
-### `system.log`
-
-- Инициализация: `Default states` → `Built-in shaders compiled` → `Input layouts` → `Constant buffers` — всё **info**, без ошибок компиляции шейдеров на старте.
-- Массовый класс проблем — **не фатальные, но архитектурно опасные предупреждения**: десятки строк вида `DX11ShaderManager: Overriding existing technique '...' in CreateTechniqueWithPS` и `Overriding existing technique '...' from external register`. Это означает **дублирование имён техник** при регистрации (встроенные техники перезаписываются регистрацией из `DX11Shader3D` и наоборот). Итог зависит от порядка вызовов и может давать **нестабильное соответствие** «имя техники → набор шейдеров/стейтов».
-
-**Shader Stage:** в логе нет типичных сообщений об ошибках стадий (например, несовпадение signature/input layout) — для данной сессии пайплайн на старте согласован.
-
-**Утечки:** по текстовым логам судить нельзя; отдельного диагностического вывода ref-count / live objects нет.
-
----
-
-## 2. Аудит `src_dx11_v2` vs «нативный DX11»
-
-### 2.1. Слой совместимости с DX9 (явные кандидаты на замену)
-
-| Область | Что в коде | Почему это «порт-заглушка» |
-|--------|------------|----------------------------|
-| Константы шейдеров | `SetVertexShaderConstantF` / `SetPixelShaderConstantF` копируют данные в **большой буфер, аналог 256 float4 регистров**, с привязкой к **b0 и b13 одновременно** (`s_device.cpp`) | Эмуляция **DX9 constant registers**, а не контракт **cbuffer + слот** под каждый шейдер |
-| Трансформации | `SetTransform(TransformType, const float*)`, накопление мировой/view/proj логики как в старом рендере | Матрицы должны жить в **явных per-frame / per-object cbuffers** и согласованных **HLSL структурах**, без «одной кучи совместимости» |
-| Освещение | `SetLight`, `LightEnable`, буфер `m_cbLights` | В DX11 нет FFP-света — это **заглушка под старый API**; свет должен быть **uniform-структурами** в шейдерах |
-| FVF | `SetFVF` зарезервирован под совместимость; вершины всё ещё описываются через **`FVF_VERTEX`** и комментарии «как D3DFVF_…» | Формат вершины должен быть **однозначным InputLayout + семантики**, без номинального FVF |
-| Техники | `DX11ShaderManager` хранит `RenderStateConfig` с `fogEnable`, `lightingEnable` и т.д., плюс **Blend modes matching DX9 techniques** (`dx11_shader_manager.h`) | Это **метаданные эпохи DX9**, перенесённые в структуры DX11; туман/свет должны быть **в шейдерах и cbuffers** |
-
-### 2.2. «Эффекты» и `.fx` — не только Microsoft FX
-
-- **`effects.cpp`**: компиляция через `D3DCompileFromFile`, ожидание входных точек вроде `VS_Main`/`PS_Main` или `main`; **большинство legacy `.fx` намеренно падает молча** — техники из файлов фактически **не поднимают** рабочий набор шейдеров.
-- **`technique.cpp`**: собственный парсер с `TECHNIQUE`, `PASS`, `*.fx` под `RESOURCE\techniques` — это **игровой DSL**, не `ID3DXEffect`, но **концептуально тот же уровень абстракции** (техника/пасс + ссылки на шейдеры).
-- **`dx11_shader_manager.cpp`**: огромный **`CreateBuiltInTechniques()`** с комментариями вроде «from maineffects.fx / game_interface.fx / ship/*.fx» — техники **вручную воспроизведены в C++** поверх общих VS/PS, а не загружаются из единого пайплайна **скомпилированных .cso**.
-
-Итог: **полный отказ от `.fx` в рантайме** потребует заменить одновременно: парсер `CTechnique`, загрузчик `Effects`, и монолит **регистрации встроенных техник** + дублирующую регистрацию в `DX11Shader3D`.
-
-### 2.3. Типы матриц
-
-- В части кода уже **`DirectX::XMMATRIX`** (модель, PBR, трава).
-- Интерфейс рендера и шейдерный «наследие» по-прежнему опираются на **массивы из 16 float / `CMatrix`**, см. комментарии в `s_device.cpp` про указатель на 16 float.
-- **Требование консистентности**: единый тип хранения (**row-major vs column-major**) и **одна договорённость** с HLSL (`column_major` / `packoffset`) на всём пути CPU → cbuffer.
-
-### 2.4. SRV / UAV / Compute / Deferred context
-
-- Текстуры: в `storm_d3d11.cpp` уже есть нормальный путь **Texture2D + SRV** для `.tx`.
-- **UAV**, **Compute `Dispatch`**, **`ID3D11DeferredContext`** в `src_dx11_v2` по поиску **практически не используются** в рендер‑ядре — к future-proofing это пока не готово, только задел через общую архитектуру устройства.
-
----
-
-## 3. Архитектурный долг: что вырезать при отказе от Effects / `.fx`
-
-1. **Runtime `D3DCompile` для продакшена** — заменить на **offline `fxc`/`dxc` → `.cso`**, загрузка `ID3D11VertexShader` / `ID3D11PixelShader` из байта + **отражение** или ручной **root layout** (слоты CB/SRV/Sampler).
-2. **`CreateBuiltInTechniques` как единственный реестр имён** — разбить на **данные** (JSON/YAML/простой бинарный manifest) или ** codegen ** на этапе сборки, чтобы убрать тысячи строк ручного дублирования и коллизий имён.
-3. **`RegisterEffectTechniques` / переопределения** — явная **одна регистрация на имя**, иначе текущие warning’и останутся источником багов.
-4. **`SetVertexShaderConstantF`-совместимость** — заменить на **набор именованных cbuffers** (`PerFrame`, `PerObject`, `Material`, `Skinning`, …), согласованных с HLSL.
-5. **Парсер `CTechnique`** — либо генерировать manifest из legacy `.fx` один раз (миграционный инструмент), либо окончательно **отказаться от текстового формата** в пользу версионируемого ассет-пайплайна.
-
----
-
-## 4. План перехода к нативному DX11 (без «полумер»)
-
-### Фаза A — Контракты и инвентаризация (2–4 недели, параллельно с игрой)
-
-- Зафиксировать **таблицу всех имён техник**, которые реально вызываются из игры/скриптов (логирование `SetTechnique` / `RS::Technique` в дебаг-сборке).
-- Для каждой техники: **vertex layout**, **какие текстуры/константы**, **blend/depth/raster** — свести в одну **спецификацию** (документ + машиночитаемый файл).
-- Разрешить коллизии имён (сейчас — **override warnings**): одна техника = один **PipelineState** (VS+PS+IL+RS+BS+DSS+sample).
-
-### Фаза B — Шейдерный пайплайн (.cso + менеджер)
-
-- Ввести **Shader Library**: каталог `.cso` + **хеш/версия** + manifest (имя → пути к VS/PS, entry points уже «запечены» в бинарнике).
-- **Менеджер шейдеров**: загрузка байткода, кэш по имени, **никакого `D3DCompile` в релизе** (только dev/fallback).
-- В HLSL: **строгие `cbuffer`** вместо «регистров c0…»; на C++: **структуры с `alignas(16)`** и явные `UpdateSubresource`/`Map` по слотам — убрать дублирование **b0/b13**.
-
-### Фаза C — Удаление эмуляции FFP
-
-- Туман, материал, фактор текстуры, освещение — перенести в **шейдеры** и **cbuffers**; `SetLight`/`RenderStateConfig::lightingEnable` как API — **пометить deprecated** и сузить до «заполнение структуры света в cbuffer».
-- **Матрицы**: внутренне **XMMATRIX / XMFLOAT4X4**, единая конвенция с шейдерами; legacy `float[16]` только на границе старого кода с последующим удалением.
-
-### Фаза D — Ресурсы
-
-- Все **текстуры в игре** — путь **Texture2D + SRV**; для пост-обработки и спецэффектов — явные **RTV + SRV** (и при необходимости **UAV** для compute-проходов).
-- Ввести **единый lifetime** для больших буферов (константные кольцевые буферы под frame-in-flight при необходимости).
-
-### Фаза E — Future-proofing
-
-- **Deferred contexts**: абстракция `IRenderContext` над `ID3D11DeviceContext`, чтобы позже часть списка команд строить в воркерах; **не использовать** immediate context напрямую из десятков мест без обёртки.
-- **Compute**: отдельный **ComputePipeline** (CS + UAV + группы потоков) для частиц, постобработки, culling — после стабилизации графического конвейера.
-
-### Фаза F — Валидация
-
-- Слой **DX11 Debug Layer** + при необходимости **GPU Validation** на CI для дебаг-сборок.
-- Контрольные сцены (локация, море, UI, тени) — **визуальные эталоны** + сравнение скриншотов.
-
----
-
-## 5. Риски и зависимости
-
-- **Коллизии техник** — уже видны в логах; без устранения любая «нативизация» даст **случайный** выбор шейдера.
-- **Legacy constants** — пока широкий пласт кода пишет в «регистры», новые cbuffers должны **покрыть всех потребителей**, иначе регрессии.
-- **Объём `.fx` в репозитории** (сотни файлов) — миграция поэтапная: сначала **критический путь рендера**, затем редкие эффекты.
-
----
-
-## 6. Итог
-
-| Вопрос | Ответ по текущему состоянию |
-|--------|-----------------------------|
-| Инициализация DX11 | В приложенных логах — **успешная**, без зафиксированных критических ошибок |
-| Утечки | **Не видны** в логах; нужен PIX/Visual Studio Graphics или инструментизация |
-| Shader stages | В этой сессии — **без явных сбоев**; предупреждения — про **дубли техник** |
-| Нативность | Слой **DX9 API на DX11** (константы, свет, трансформы, FVF-наследие) + **техники, воспроизводящие .fx в C++** |
-| Полный отказ от `.fx` | Требует **нового конвейера ассетов (.cso + manifest)**, рефакторинга **DX11ShaderManager / DX11Shader3D / technique.cpp / effects.cpp** |
-
----
-
-Когда утвердите этот план (или уточните приоритеты: например, «сначала только 3D-мир без UI»), можно переходить к конкретным этапам реализации и первым изменениям в коде.
+Still not done (from your directive / prior summary)
+CreateDefaultShaders / dx11_shader_manager — D3DCompile and embedded HLSL; .cso loading and removal of runtime compile.
+Single owner for b0–b2 vs DX11ShaderManager::SetMatrices ( UpdateConstantBuffers still only forwards to the shader manager).
+**Full XMMATRIX fill of CBPerFrame / CBPerObject every frame ( WorldViewProj, inverse-transpose, camera row, etc.).
