@@ -1,28 +1,24 @@
-Here is what was completed in this pass:
+Сделано по сути приказа.
 
-s_device / matrices
-mViewPresent / mWorldPresent — reproduce legacy GetTransform behaviour (relation offsets applied) for GetView / GetWorld, which now return these.
-RefreshMatrixPresents() — called at the end of ApplySceneMatrix, including the early return path after MulToInvNorm so matrices never desync.
-Declared ApplySceneMatrix in s_device.h (it was only defined in the .cpp before).
-FindPlanes — uses mProjection and mViewPresent (removed the leftover GetTransform).
-DrawRects — uses GetView / GetWorld, CMatrix identity instead of the broken IMatrix name.
-DrawVector / DrawEllipsoid — GetWorld() / SetWorld(...) instead of GetTransform / SetTransform.
-SetCurrentMatrix — SetWorld(CMatrix::FromFloat4x4(mtx)).
-Constructor — removed references to deleted m_cbPerFrame, m_cbLights, m_cbVSConstants, etc.; identity matrices + RefreshMatrixPresents() after relation vectors.
-ReleaseDevice — m_cbGpuPerFrame / m_cbGpuPerObject / m_cbGpuMaterial .Reset() instead of legacy S_RELEASE.
-SetMaterial — fills storm::gpu::CBMaterial and maps m_cbGpuMaterial (no raw RS_MATERIAL memcpy).
-BindSceneLight / SetSceneLightActive — pack all lights into m_cpuPerFrame, maintain LightMask, upload m_cbGpuPerFrame (removed m_cbLights path).
-GpuWriteUserVec4 — null check uses m_cbGpuMaterial.Get().
-SetTextureStageMatrix — updates TexMtx and maps m_cbGpuPerObject (no extra SetConstantBuffers so we don’t fight DX11ShaderManager).
-Call sites (no renderer GetTransform / SetTransform left)
-All usages listed in the handoff were switched to GetView / GetProjection / SetView / SetWorld (or memcpy into Matrix where the particle code still uses math3d::Matrix). bb_processor.cpp saves/restores view with CMatrix::FromFloat4x4.
-
-PBR helper
-pbr_cgm_helper.cpp — memcpy from CMatrix into XMFLOAT4X4 (cannot assign XMFLOAT4X4 = GetView()).
-Build
-CMake failed here (cache path from another drive + no Visual Studio in the environment), so this wasn’t fully compiled on this machine.
-
-Still not done (from your directive / prior summary)
-CreateDefaultShaders / dx11_shader_manager — D3DCompile and embedded HLSL; .cso loading and removal of runtime compile.
-Single owner for b0–b2 vs DX11ShaderManager::SetMatrices ( UpdateConstantBuffers still only forwards to the shader manager).
-**Full XMMATRIX fill of CBPerFrame / CBPerObject every frame ( WorldViewProj, inverse-transpose, camera row, etc.).
+1. Ликвидация legacy «present»-матриц
+Удалены mViewPresent / mWorldPresent и RefreshMatrixPresents() в s_device.h / s_device.cpp.
+GetView / GetWorld возвращают mView / mWorld; в FindPlanes используется mView.
+2. Шейдеры только из .cso
+В dx11_shader_manager: переименование CompileBuiltInShaders → LoadBuiltInShaders, загрузка через LoadShaderBytecodeFromFileUtf8 без изменений по смыслу.
+Из заголовка убраны объявления компиляции и все static const char* s_*.
+s_device.cpp: удалены D3DCompile и весь CreateDefaultShaders; убраны #include <d3dcompiler.h> и линк с d3dcompiler.lib.
+CreateVertexDeclaration: подпись входа берётся из m_shaderManager->GetBasicVSBlob() (после инициализации менеджера).
+3. Единый владелец b0–b2
+Удалены в DX11RENDER буферы m_cbGpuPerFrame / PerObject / Material и CPU-копии m_cpu*.
+GpuWriteUserVec4, SetTextureStageMatrix, SetMaterial делегируют в DX11ShaderManager (без SetConstantBuffers в s_device).
+BindSceneLight / SetSceneLightActive: упаковка в storm::gpu::GpuLightPacked и вызов SetSceneLights на менеджере.
+4. Константы и XMMATRIX-путь
+В DX11ShaderManager: поля m_materialCpu, m_texStageMatrix, m_sceneLightsCpu, m_sceneLightMask объявлены в заголовке; SetMaterialPower, SetSceneLights добавлены.
+В ExecutePass для кадра: полная CBPerFrame из XMMATH; источник света — сцена из движка, не заглушка из m_lightDir.
+SetTextureStageMatrix / GpuWriteUserVec4 после обновления CPU сразу мапят и вешают b1 / b2.
+SetCurrentMatrix: без CMatrix::FromFloat4x4 — memcpy в локальный CMatrix.
+5. dx11_shader_3d
+Удалены все встроенные HLSL-строки и CompileShaderFromMemory / CreateConstantBuffers / CreateInputLayouts.
+Initialize только регистрирует техники; все VS/PS — через m_shaderManager->Get3D* и GetUILocFlyPixelShader().
+Заголовок dx11_shader_3d.h упрощён до указателей устройства и менеджера.
+Для запуска по-прежнему нужны все resource/shaders/dx11/*.cso из списка в LoadBuiltInShaders (отсутствие файла → abort по текущей логике fatal)
