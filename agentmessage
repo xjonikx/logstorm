@@ -1,24 +1,126 @@
-Сделано по сути приказа.
+Ниже — выводы по фактической структуре storm-engine-upgrade (в т.ч. tools/world_editor/testenv и storm_world_editor.py) и API движка из src/libs/location и RESOURCE/shared/messages.h. Отдельный путь storm-engine-twitch\...\testenv по смыслу совпадает с тем же пайплайном «скрипты .c + RESOURCE», но в этой сессии инструментам IDE не удалось прочитать его дерево по абсолютному пути; архитектурно это тот же класс проектов.
 
-1. Ликвидация legacy «present»-матриц
-Удалены mViewPresent / mWorldPresent и RefreshMatrixPresents() в s_device.h / s_device.cpp.
-GetView / GetWorld возвращают mView / mWorld; в FindPlanes используется mView.
-2. Шейдеры только из .cso
-В dx11_shader_manager: переименование CompileBuiltInShaders → LoadBuiltInShaders, загрузка через LoadShaderBytecodeFromFileUtf8 без изменений по смыслу.
-Из заголовка убраны объявления компиляции и все static const char* s_*.
-s_device.cpp: удалены D3DCompile и весь CreateDefaultShaders; убраны #include <d3dcompiler.h> и линк с d3dcompiler.lib.
-CreateVertexDeclaration: подпись входа берётся из m_shaderManager->GetBasicVSBlob() (после инициализации менеджера).
-3. Единый владелец b0–b2
-Удалены в DX11RENDER буферы m_cbGpuPerFrame / PerObject / Material и CPU-копии m_cpu*.
-GpuWriteUserVec4, SetTextureStageMatrix, SetMaterial делегируют в DX11ShaderManager (без SetConstantBuffers в s_device).
-BindSceneLight / SetSceneLightActive: упаковка в storm::gpu::GpuLightPacked и вызов SetSceneLights на менеджере.
-4. Константы и XMMATRIX-путь
-В DX11ShaderManager: поля m_materialCpu, m_texStageMatrix, m_sceneLightsCpu, m_sceneLightMask объявлены в заголовке; SetMaterialPower, SetSceneLights добавлены.
-В ExecutePass для кадра: полная CBPerFrame из XMMATH; источник света — сцена из движка, не заглушка из m_lightDir.
-SetTextureStageMatrix / GpuWriteUserVec4 после обновления CPU сразу мапят и вешают b1 / b2.
-SetCurrentMatrix: без CMatrix::FromFloat4x4 — memcpy в локальный CMatrix.
-5. dx11_shader_3d
-Удалены все встроенные HLSL-строки и CompileShaderFromMemory / CreateConstantBuffers / CreateInputLayouts.
-Initialize только регистрирует техники; все VS/PS — через m_shaderManager->Get3D* и GetUILocFlyPixelShader().
-Заголовок dx11_shader_3d.h упрощён до указателей устройства и менеджера.
-Для запуска по-прежнему нужны все resource/shaders/dx11/*.cso из списка в LoadBuiltInShaders (отсутствие файла → abort по текущей логике fatal)
+Подтверждение
+Да, собрать полноценный level design tool под Storm Engine реалистично, но не «одним монолитом за неделю»: движок уже разделяет рендер/коллизию/локаторы (C++) и логику уровня (скрипты PROGRAM). Редактор должен опираться на существующий контракт данных (locations[n]…, персонажи, диалоги) и при необходимости добавлять слой проекта (JSON/SQLite) с детерминированным экспортом в .c и проверкой в testenv.
+
+1. Конструктор локаций и пропсов
+Сканирование .gm для «пустой» локации
+Каталог моделей задаётся в локации как locations[n].filespath.models (например "locations\Estate"), а сами ссылки — базовые имена без .gm: locations[n].models.always.estate = "estate" и пара …_locators для точек (см. QuestLocations.c).
+Практический скан: обход testenv/RESOURCE (или общего RESOURCE) по filespath.models и глобально **/MODELS/**/*.gm, фильтр «статика» = не персонажные пути/именование по конвенции проекта + опционально эвристика «есть одноимённый *_locators / используется в locations.*».
+Каталог tools/fbx_to_cgm и locator_editor.py уже завязаны на локаторы из .gm Storm — это можно переиспользовать как библиотеку пресетов/валидации, а не только FBX.
+Сохранение позиции / поворота / масштаба пропов
+Фактическая загрузка статики идёт через LocLoadModel в locations_loader.c: сначала MSG_LOCATION_ADD_MODEL, затем опционально привязка к локатору (*.locator.group / *.locator.name), затем модификаторы rotate, uvslide, и т.д.
+
+bool LocLoadModel(aref loc, string sat, string addition)
+{
+	// ...
+    res = SendMessage(loc, "lssll", MSG_LOCATION_ADD_MODEL, loc.(sat) + addition, tech, level, dynamicLightsOn);
+	// ...
+	attr = sat + ".locator.group";
+	if(CheckAttribute(loc, attr) != 0)
+	{
+		// ...
+			res = SendMessage(loc, "lss", MSG_LOCATION_MODEL_SET_POS, loc.(attr), loc.(attr1));
+	// ...
+	attr = sat + ".rotate";
+	if(CheckAttribute(loc, attr) != 0)
+	{
+		// ...
+		res = SendMessage(loc, "lfff", MSG_LOCATION_MODEL_SET_ROT, x, y, z);
+В C++ MSG_LOCATION_MODEL_SET_POS копирует матрицу из именованного локатора в последнюю загруженную модель — то есть «истинные» координаты чаще живут в **.gm локаторов**, а в .c` хранится ссылка на группу/имя, а не свободные world-space float для каждого пропа.
+
+    case MSG_LOCATION_MODEL_SET_POS: {
+        // ...
+        const std::string &name = message.String();
+        la = FindLocatorsGroup(name.c_str());
+        // ...
+        const std::string &name2 = message.String();
+        i = la->FindByName(name2.c_str());
+        // ...
+        la->GetLocatorPos(i, model[lastLoadStaticModel]->mtx);
+        return 1;
+Масштаб отдельным полем в LocLoadModel не проходит; типичный путь Storm — правка/пересборка .gm или отдельная доработка движка/экспортёра. Для редактора «как UE» разумный компромисс: в проектном слое хранить scale, а при экспорте либо (а) писать в расширенный формат, если движок расширите, либо (б) офлайн-препроцесс модели.
+
+Синхронизация локаторов обратно в атрибуты локации поддерживается сообщением MSG_LOCATION_UPDATELOCATORS (см. messages.h).
+
+2. Интерактивность и триггеры
+Через редактор
+Анимация сундука / двери: в данных это обычно связка модель + квестовые атрибуты + скрипт (например сундуки через privateN, ключи, предметы в QuestLocations.c), плюс вызовы SendMessage к сущностям/персонажам где нужно. Редактор должен давать шаблоны сущностей (chest, door) и генерировать нужные ветки locations[n].… и/или квестовый .c.
+«Триггер зоны» в классическом Storm ближе к группам локаторов (goto, reload, item, patrol, радиусы locators_radius) и к LAi / событиям, а не к отдельной таблице «Box Trigger». Для персонажа есть детекторы локаторов: MSG_CHARACTER_ADD_DETECTOR / DEL в messages.h.
+Коллайдеры / триггеры в коде и визуализация
+Коллизия геймплея: трассировка через сервис COLLIDE к геометрии моделей (.gm окружение, .cgm персонажи — это явно отражено в character_entity и location.cpp при работе с CGM/GM).
+Триггеры в данных: прежде всего локаторы + радиусы (MSG_LOCATION_GRP_RADIUS, MSG_LOCATION_LOC_RADIUS, MSG_LOCATION_VIEWLGROUP для отладочной отрисовки сфер в движке).
+    case MSG_LOCATION_VIEWLGROUP: {
+        const std::string &name = message.String();
+        la = FindLocatorsGroup(name.c_str());
+        // ...
+        la->isVisible = true;
+        la->kViewRadius = message.Float();
+        la->viewDist = message.Float();
+        la->color = message.Long();
+        isDebugView = true;
+        return 1;
+В редакторе: дублировать эту геометрию в оверлее (сферы/капсулы), подсвечивать группы reload / item / кастомные «quest».
+
+3. NPC и «живой мир»
+Создание с нуля
+Классический NPC: записи makeref(ch, Characters[n]) в PROGRAM/characters/init/*.c с полями location, location.group, location.locator, model, Dialog.Filename и т.д. (парсер уже в storm_world_editor.py).
+CGM-путь в testenv описан в cgm_characters.c: создание CharacterEntity, MSG_CGM_LOAD_MODEL, MSG_CGM_LOAD_ANIMATION, MSG_CGM_PLAY_ACTION — удобно для вьюпорта редактора и тестов без полного LAi.
+«Карман» / лут через GUI
+В локациях лут сундуков задаётся атрибутами вида locations[n].private1.items.* (пример в QuestLocations.c).
+Для NPC лут обычно разбросан по инвентарным полям персонажа и квестовым таблицам в скриптах; GUI редактора = редактор предметных ID с автодополнением из items/goods скриптов + валидация.
+Waypoints
+Навигация опирается на локаторные группы (goto, patrol — см. LAi_login.c, LAi_utilites.c: PlaceCharacter(..., "patrol", ...)).
+Визуализация: импорт позиций из *_locators.gm + режим «ребра» между точками патруля, экспорт либо в имена локаторов (если движок ждёт фиксированные имена), либо в генерируемый набор локаторов в GM-пайплайне.
+4. Логика и диалоги
+Связка NPC ↔ диалог
+У персонажа задаётся Dialog.Filename (см. characters_init.c / парсер в storm_world_editor.py).
+Диалоги — это отдельные .c файлы с единой точкой входа void ProcessDialogEvent() и дальнейшей развилкой по Dialog.CurrentNode, Link, NextDiag (пример: dialogs/russian/Common_Store.c).
+void ProcessDialogEvent()
+{
+	ref NPChar;
+	aref Link, NextDiag;
+	DeleteAttribute(&Dialog,"Links");
+	makeref(NPChar,CharacterRef);
+	makearef(Link, Dialog.Links);
+	makearef(NextDiag, NPChar.Dialog);
+Редактор: граф узлов (CurrentNode → links) с генерацией/парсингом этого паттерна + #include сегментов по городам (LoadSegment в том же файле).
+
+5. Техническая связка
+Парсинг и перезапись testenv
+Источник истины для движка — текстовые PROGRAM/**/*.c в кодировке cp1251 (редактор уже пробует cp1251/utf-8 при чтении). Перезапись = идемпотентный кодогенератор блоков locations[n]… / makeref… с сохранением ручных #include и кастомного кода вне шаблонов — либо хранение «оверлея» и аккуратный merge.
+Запуск проверки: уже заложено в storm_world_editor.py (TESTENV_PATH, генерация тестовых скриптов, кнопка запуска engine.exe).
+.gm и .cgm в одном вьюпорте
+Локация: массив статических моделей Location + локаторы.
+Персонаж: CharacterEntity / старый character + сообщения из messages.h (MSG_CHARACTER_*, MSG_CGM_*).
+Общая сцена редактора: один рендер-стек (встроенный движок или общая библиотека загрузки) + единая камера; коллизия уже умеет CGM vs GM на уровне движка.
+Анимации и «состояния»
+Сообщения уровня: MSG_CHARACTER_ACTIONPLAY, MSG_MODEL_PLAY_ACTION, для CGM — MSG_CGM_PLAY_ACTION.
+Редактор состояний = таблица состояние → имя клипа (+ параметры бленда), экспорт в данные NPC или в квестовый скрипт, который дергает SendMessage при смене состояния LAi.
+6. Дополнения, коллизия, море/корабли/карта
+Улучшения уровня «Storm-native IDE»
+Дифф/merge для locations/init и диалогов, профили экспорта (только остров / только квестовая локация).
+Live link: правка локатора → MSG_LOCATION_UPDATELOCATORS → обратно в .c.
+Регресс-тест: автозагрузка выбранной локации в testenv (у вас уже есть тестовый режим в seadogs.c).
+Контент-пайплайн: связка с fbx_to_cgm и проверкой локаторов.
+Коллизия для всех объектов
+Статика и окружение: коллизия из меша .gm (трассировка COLLIDE).
+Персонажи: .cgm + стандартная коллизия (см. комментарии в cgm_characters.c / character_entity).
+Геймплейные объёмы без меша: расширение через локаторы + радиусы или отдельный «volume» слой в проекте с экспортом в скрипты.
+Корабли, море, карта мира
+В locations_loader.c при флагах environment.sea, boarding, camshuttle создаётся море, погода, корабельное окружение; есть LocLoadShips и привязка к Location.locators.
+Глобальная карта — отдельная подсистема (src/libs/worldmap в апгрейде); редактор мира должен иметь режим «интерьер» (location) и режим «стратегическая карта» (worldmap), с общим каталогом колоний/переходов (reload, worldmap поля в Location).
+Архитектура системы сохранения (единый подход)
+ProjectModel (в памяти): локации, сущности (prop/NPC/trigger), ссылки на файлы ассетов, граф диалогов, маршруты, квестовые хуки.
+StormExport: сериализация в канонические .c + минимальные правки RESOURCE (пути, loading screens).
+AssetIndex: скан .gm/.cgm/.an с метаданными (bbox, количество локаторов, набор анимаций).
+Validator: прогон движка в headless или быстрый LoadLocation + лог ошибок (LocationLoader: not loaded model…).
+Optional sidecar: например level.json рядом с квестом для данных, которые нельзя выразить в текущем .c без шума — с шагом «Bake into .c» перед релизом.
+Честное ограничение текущего storm_world_editor.py
+Он уже парсит локации и персонажей, но для карт локаторов в UI прямо указано, что позиции пока фиктивные, без чтения реальных координат из .gm:
+
+        # Обновляем карту (пока без реальных локаторов из GM файла)
+        # Создаем фиктивные локаторы на основе переходов и персонажей
+Полноценный редактор закрывается ровно на этом шаге: парсер .gm локаторов + запись обратно + связка с locations[n].
+
+Итого: подтверждаю готовность концепции «с нуля собрать уровень, пропсы, NPC, лут, диалоги» при опоре на описанные форматы и доработке экспортёра под реальные трансформы (особенно масштаб и произвольные позиции без локатора, если они вам критичны). Если нужно, следующим шагом могу детализировать только один слой (например, только формат сундуков + privateN + LAi) уже под ваш целевой жанр/мод.
